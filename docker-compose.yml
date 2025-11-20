@@ -1,0 +1,14 @@
+services:
+  voice-assistant:
+    build: .
+    ports:
+      - "8035:8035"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ENVIRONMENT=production
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./greetings:/app/app/greetings
+    restart: unless-stopped

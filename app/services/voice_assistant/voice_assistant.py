@@ -1,0 +1,208 @@
+import os
+import json
+import uuid
+import re
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from dotenv import load_dotenv
+import openai
+
+# Load environment variables
+load_dotenv()
+
+class VoiceAssistantService:
+    def __init__(self):
+        # Configure OpenAI API
+        self.client = openai.OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY")
+        )
+    
+    async def process_voice_and_text(
+        self, 
+        transcribed_text: str,
+        date_time: str
+    ) -> Dict[str, Any]:
+        """
+        Process transcribed audio to create a task JSON
+        
+        Args:
+            transcribed_text: Text from speech-to-text conversion
+            date_time: Current date and time in ISO format (e.g., "2025-07-24T14:18:36.514Z")
+            
+        Returns:
+            Dictionary containing task information
+        """
+        try:
+            # Parse the input date_time to get today and tomorrow
+            current_date = datetime.fromisoformat(date_time.replace('Z', '+00:00'))
+            tomorrow_date = current_date + timedelta(days=1)
+            
+            # Create prompt for OpenAI to extract task information
+            prompt = f"""
+            YOU MUST BE PREPARED FOR MULTILINGUAL INPUTS. Your task has two steps:
+
+            STEP 1: FIX ANY TRANSCRIPTION ERRORS IN THE INPUT TEXT
+            - Keep the same language as the input
+            - Fix any obvious transcription errors (especially with numbers, dates, times)
+            - Maintain the original meaning and intent
+            - If text mentions time (like 2:00 or 14:00), ensure it's properly formatted
+            - Fix any word spacing issues
+            - DO NOT translate to another language
+            - If the text is already correct, use it as is
+
+            STEP 2: EXTRACT TASK INFORMATION FROM THE CORRECTED TEXT
+            
+            ⚠️ CRITICAL LANGUAGE RULE - ABSOLUTELY NO TRANSLATION ALLOWED ⚠️
+            
+            1. Count the words in each language in the input text
+            2. The language with MORE WORDS is the PRIMARY language
+            3. ALWAYS use the PRIMARY language for 'title' and 'description' - NEVER translate them
+            4. Even if English words appear in German text, if German has more words, use GERMAN
+            5. Even if German words appear in English text, if English has more words, use ENGLISH
+            
+            Language Detection Examples:
+            - "Ich muss die bank über die neue transaktion informieren, bitte schick die email" 
+              → German: 11 words, English: 2 words → PRIMARY: German → Use German for title/description
+            - "Ich habe ein appointment tomorrow mit dem doctor" 
+              → German: 5 words, English: 3 words → PRIMARY: German → Use German for title/description
+            - "I need to call the Arzt tomorrow about my Termin"
+              → English: 7 words, German: 2 words → PRIMARY: English → Use English for title/description
+            
+            NEVER TRANSLATE THE TITLE OR DESCRIPTION - KEEP THEM IN THE PRIMARY LANGUAGE!
+            
+            ALL OTHER FIELD VALUES (priority, date, time, category, tags) SHOULD BE IN ENGLISH. DON'T USE TOMORROW, TODAY, NEXT WEEK, etc. IN THE TITLE OR DESCRIPTION.
+            
+            Current date and time: {date_time}
+            Today's date: {current_date.strftime('%Y-%m-%d')} ({current_date.strftime('%A, %B %d, %Y')})
+            Tomorrow's date: {tomorrow_date.strftime('%Y-%m-%d')} ({tomorrow_date.strftime('%A, %B %d, %Y')})
+            
+            Analyze the following text and extract task information to create a structured task JSON.
+            The text might contain a task request, reminder, or action item.
+            
+            Text to analyze: "{transcribed_text}"
+            
+            Please extract and structure this information into a task with the following format:
+            - title: A clear, concise title for the task (IN THE PRIMARY LANGUAGE - NO TRANSLATION!) NOTE: DON'T USE TOMORROW, TODAY, NEXT WEEK, etc. IN THE TITLE
+            - description: Detailed description of what needs to be done (IN THE PRIMARY LANGUAGE - NO TRANSLATION!) NOTE: DON'T USE TOMORROW, TODAY, NEXT WEEK, etc. IN THE DESCRIPTION
+            - priority: Determine if this is "high", "medium", or "low" priority based on urgency keywords (IN ENGLISH)
+            - date: Extract any date mentions and convert to YYYY-MM-DD format. Common phrases:
+              * "tomorrow/morgen" = {tomorrow_date.strftime('%Y-%m-%d')}
+              * "today/heute" = {current_date.strftime('%Y-%m-%d')}
+              * "next week/nächste woche" = approximate to 7 days from today
+              * If no date mentioned, leave as null
+            - time: Extract any time mentions in HH:MM format (24 hr), if applicable. If no time mentioned, leave it as "null", MUST NOT SEND MORNING,EVENING, AFTERNOON, NIGHT, etc.
+            - category: Categorize the task (work, personal, health, shopping, meeting, reminder, etc.) (IN ENGLISH)
+            - tags: Extract relevant keywords as tags (IN ENGLISH)
+            
+            Respond with a JSON object only, no additional text.
+            
+            Example for German input with some English words:
+            Input: "Ich muss die bank über die neue transaktion informieren, bitte schick die email"
+            {{
+                "title": "Bank über neue Transaktion informieren",
+                "description": "Die Bank über die neue Transaktion informieren und Email schicken",
+                "priority": "medium",
+                "date": null,
+                "time": null,
+                "category": "work",
+                "tags": ["bank", "transaction", "email"]
+            }}
+            
+            Example for English input with some German words:
+            Input: "I need to call the Arzt tomorrow about my Termin"
+            {{
+                "title": "Call the doctor about appointment",
+                "description": "Need to call the doctor tomorrow to discuss the appointment",
+                "priority": "medium",
+                "date": "{tomorrow_date.strftime('%Y-%m-%d')}",
+                "time": null,
+                "category": "health",
+                "tags": ["call", "doctor", "appointment"]
+            }}
+            """
+
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that extracts task information from text and returns it as JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                task_data = json.loads(json_str)
+            else:
+                raise ValueError("No valid JSON found in AI response")
+            
+            task_data["id"] = str(uuid.uuid4())
+            task_data["status"] = "pending"
+
+            task_data = self._validate_task_data(task_data)
+            
+            return {
+                "task": task_data,
+                "success": True,
+                "message": "Task successfully created from voice input using OpenAI"
+            }
+            
+        except json.JSONDecodeError as e:
+            return {
+                "task": None,
+                "success": False,
+                "message": f"Failed to parse AI response as JSON: {str(e)}"
+            }
+        except openai.OpenAIError as e:
+            return {
+                "task": None,
+                "success": False,
+                "message": f"OpenAI API error: {str(e)}"
+            }
+        except Exception as e:
+            return {
+                "task": None,
+                "success": False,
+                "message": f"Error processing voice input: {str(e)}"
+            }
+    
+    def _validate_task_data(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and clean task data"""
+        if "title" not in task_data or not task_data["title"]:
+            task_data["title"] = "Untitled Task"
+        
+        if "description" not in task_data:
+            task_data["description"] = task_data.get("title", "No description")
+        
+        if "priority" not in task_data or task_data["priority"] not in ["high", "medium", "low"]:
+            task_data["priority"] = "medium"
+        
+        if "category" not in task_data:
+            task_data["category"] = "general"
+        
+        if "tags" not in task_data:
+            task_data["tags"] = []
+        
+        if "date" in task_data and task_data["date"]:
+            try:
+                datetime.strptime(task_data["date"], '%Y-%m-%d')
+            except ValueError:
+                try:
+                    parsed_date = datetime.fromisoformat(task_data["date"].replace('Z', '+00:00'))
+                    task_data["date"] = parsed_date.strftime('%Y-%m-%d')
+                except:
+                    task_data["date"] = None
+        
+        if "due_date" in task_data:
+            if task_data["due_date"] and not task_data.get("date"):
+                try:
+                    parsed_date = datetime.fromisoformat(task_data["due_date"].replace('Z', '+00:00'))
+                    task_data["date"] = parsed_date.strftime('%Y-%m-%d')
+                except:
+                    pass
+            del task_data["due_date"]
+        
+        return task_data
